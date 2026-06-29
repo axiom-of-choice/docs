@@ -1,0 +1,183 @@
+---
+title: Trace LiveKit applications
+sidebarTitle: LiveKit
+---
+
+Trace your [LiveKit Agents](https://docs.livekit.io/agents/) voice agents to LangSmith with the LangSmith LiveKit integration. For high-level conventions, see [Voice tracing fundamentals](/langsmith/trace-voice-fundamentals).
+
+<Note>
+The LiveKit integration requires `langsmith[livekit]`. It is in development, so its API may change.
+</Note>
+
+The integration captures each conversation as a single LangSmith trace, with a span for every pipeline stage (STT, LLM, TTS) grouped by turn, plus LiveKit's per-stage latency and token metrics. You enable it with one call and do not create any spans yourself.
+
+## Install
+
+Install the integration along with the LiveKit plugins your agent uses:
+
+<CodeGroup>
+
+```bash pip
+pip install "langsmith[livekit]" "livekit-agents[openai,silero,turn-detector]"
+```
+
+```bash uv
+uv add "langsmith[livekit]" "livekit-agents[openai,silero,turn-detector]"
+```
+
+</CodeGroup>
+
+## Set environment variables
+
+The integration reads your LangSmith credentials from the environment and exports to LangSmith for you:
+
+```bash .env
+LANGSMITH_API_KEY=<your-langsmith-api-key>
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=livekit-voice
+LIVEKIT_URL=<your-livekit-url>
+LIVEKIT_API_KEY=<your-livekit-api-key>
+LIVEKIT_API_SECRET=<your-livekit-api-secret>
+OPENAI_API_KEY=<your-openai-api-key>
+```
+
+## Set up tracing
+
+Import `configure_livekit` and call it once before creating your `AgentServer`. It builds the tracer provider, registers the LangSmith span processor, and wires it into LiveKit:
+
+```python
+from langsmith.integrations.livekit import configure_livekit
+from livekit import agents
+from livekit.agents import Agent, AgentServer, AgentSession
+
+# Enable tracing before creating agents.
+configure_livekit()
+
+server = AgentServer()
+
+@server.rtc_session()
+async def my_agent(ctx: agents.JobContext):
+    session = AgentSession(
+        stt="deepgram/nova-2:en",
+        llm="openai/gpt-5.4-mini",
+        tts="openai/tts-1:alloy",
+    )
+    await session.start(room=ctx.room, agent=Agent(instructions="You are a helpful assistant."))
+```
+
+This works for both the STT/LLM/TTS cascade and speech-to-speech models: build the `AgentSession` with a realtime model (for example, `lk_openai.realtime.RealtimeModel(...)`) and the tracing setup is unchanged.
+
+## Record the conversation audio
+
+The integration attaches the call recording to the conversation root span. How you capture that recording differs between local development and production.
+
+### Development: embed a local file
+
+In console and local development, enable LiveKit's session recording and point `audio_path_provider` at the `audio.ogg` LiveKit writes under `ctx.session_directory`. The integration reads that file and embeds the bytes in the trace.
+
+```python
+from pathlib import Path
+
+_audio_path: Path | None = None
+configure_livekit(audio_path_provider=lambda: _audio_path)
+
+@server.rtc_session()
+async def my_agent(ctx: agents.JobContext):
+    global _audio_path
+    _audio_path = ctx.session_directory / "audio.ogg"
+    await session.start(
+        room=ctx.room,
+        agent=Agent(instructions="You are a helpful assistant."),
+        record={"audio": True},
+    )
+```
+
+In console mode, also pass `--record` on the command line. The recording reflects what was played to the client, so a barge-in shows up truncated.
+
+<Warning>
+Don't use `audio_path_provider` in production. In a deployed worker, `ctx.session_directory` is an ephemeral temporary directory that LiveKit deletes when the session ends, so there is no durable file to embed.
+</Warning>
+
+### Production: record with Egress and attach a URL
+
+In production, record the room with [LiveKit Egress](https://docs.livekit.io/home/egress/overview/) into your own object storage, then give the integration the recording's URL with `audio_url_provider`. The integration stamps it on the trace as `langsmith.metadata.audio_url` — a pointer to where the recording lives, rather than the audio bytes, so traces stay light.
+
+Start an **audio-only room-composite egress** at the start of the session with a deterministic `filepath`. Because you choose the path up front, you know the final URL immediately, even though Egress keeps uploading after the session ends.
+
+```python
+import contextvars
+import os
+
+from livekit import agents, api
+from livekit.agents import Agent, AgentServer, AgentSession
+from langsmith.integrations.livekit import configure_livekit
+
+RECORDING_BUCKET = os.environ["RECORDING_BUCKET"]
+
+# A ContextVar (not a global) so concurrent sessions on one worker don't collide.
+_recording_url: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "recording_url", default=None
+)
+
+configure_livekit(audio_url_provider=_recording_url.get)
+
+server = AgentServer()
+
+@server.rtc_session()
+async def my_agent(ctx: agents.JobContext):
+    key = f"recordings/{ctx.room.name}.ogg"
+
+    lkapi = api.LiveKitAPI()  # reads LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET
+    await lkapi.egress.start_room_composite_egress(
+        api.RoomCompositeEgressRequest(
+            room_name=ctx.room.name,
+            audio_only=True,
+            file_outputs=[
+                api.EncodedFileOutput(
+                    file_type=api.EncodedFileType.OGG,
+                    filepath=key,
+                    s3=api.S3Upload(
+                        bucket=RECORDING_BUCKET,
+                        region=os.environ["AWS_REGION"],
+                        access_key=os.environ["AWS_ACCESS_KEY_ID"],
+                        secret=os.environ["AWS_SECRET_ACCESS_KEY"],
+                    ),
+                )
+            ],
+        )
+    )
+    _recording_url.set(f"https://{RECORDING_BUCKET}.s3.amazonaws.com/{key}")
+
+    session = AgentSession(...)
+    await session.start(room=ctx.room, agent=Agent(instructions="..."))
+```
+
+LiveKit Egress also supports [Google Cloud Storage and Azure](https://docs.livekit.io/home/egress/overview/) outputs — swap `s3=` for `gcp=api.GCPUpload(...)` or `azure=api.AzureBlobUpload(...)`.
+
+<Warning>
+The recording URL is stored as trace metadata, so anyone who can read the trace can read the URL. Point it at non-public storage, and if the URL itself grants access, generate a short-lived presigned URL instead of a permanent one.
+</Warning>
+
+For the underlying attachment API used by the development path, see [Upload files with traces](/langsmith/upload-files-with-traces).
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Voice fundamentals" icon="waveform" href="/langsmith/trace-voice-fundamentals">
+    Core conventions for tracing voice agents.
+  </Card>
+  <Card title="Upload files with traces" icon="paperclip" href="/langsmith/upload-files-with-traces">
+    Attach the conversation audio recording to your trace.
+  </Card>
+</CardGroup>
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to Claude, VSCode, and more via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/trace-with-livekit.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>
